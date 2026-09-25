@@ -11,6 +11,46 @@ The algorithm can be used in any statistical learning scenario.
 Submitted to Entropy
 
 Filip Koprivec, Klemen Kenda, Beno Šircelj
+
+## Changes to the original mating behaviour
+
+Two defaults in the mating step now differ from the 2020 code that produced
+the published results (see issue #1). **Runs with the new defaults are not
+comparable to earlier results**: both the search and the random-number stream
+change. The original behaviour is kept behind a flag for each:
+
+- **Weighted information-gain mating no longer always adds the top genes.**
+  `IntersectionMatingWithWeightedRandomInformationGain` used to start from its
+  parent class's child: the intersection *plus* the top-k genes by mutual
+  information. It then sampled k more on top of those. So the top-k were always
+  included and a child got up to 2k genes back (1.3k on average), and the
+  "weighted random" part rarely added anything new. It now starts from the
+  plain intersection and adds only the weighted sample.
+  `include_top_genes=True` restores the original.
+- **An item is no longer mated with itself.** `RandomEveryoneWithEveryone` drew
+  its mating pool with replacement, so the same item could be picked twice and
+  paired with itself. The child was a copy of the parent, which took up a
+  crossover slot (about 13% of pairs with `pool_size=3`). The pool is now drawn
+  without replacement and is capped at the population size.
+  `allow_self_mating=True` restores the original.
+
+To reproduce results produced before this change, set both flags:
+
+```python
+mating = RandomEveryoneWithEveryone(
+    pool_size=3,
+    allow_self_mating=True,
+    mating_strategy=IntersectionMatingWithWeightedRandomInformationGain(
+        include_top_genes=True))
+```
+
+With both flags set, a run is identical to the original code: the same fits
+and the same Pareto front for the same seed.
+
+One bug fix needs no flag: `RandomEveryoneWithEveryone(pool_size=None)` is
+meant to use the whole population as the mating pool. It used to crash, and
+now works.
+
 ## Optional: swap operator in the pruning step (off by default)
 
 Pruning (`purge_front_with_information_gain`) identifies a weak feature by

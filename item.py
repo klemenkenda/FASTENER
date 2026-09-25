@@ -175,17 +175,26 @@ class IntersectionMatingWithInformationGain(IntersectionMating):
 class IntersectionMatingWithWeightedRandomInformationGain(
     IntersectionMatingWithInformationGain):
     def __init__(self, number: Optional[IntScaling] = None,
-                 scaling=None) -> None:
+                 scaling=None, include_top_genes: bool = False) -> None:
         super().__init__(number)
         self.number = number or self.default_number
         self.scaling = scaling or self.default_scaling
+        # The original started from the parent class's child -- the
+        # intersection plus the top-k genes by information gain -- and then
+        # sampled k more, so the top-k were always included and a child got up
+        # to 2k genes back (1.3k on average). True restores that exactly, for
+        # reproducing results produced before this was changed.
+        self.include_top_genes = include_top_genes
 
     @staticmethod
     def default_scaling(x):
         return np.log1p(np.log1p(np.log1p(x)))
 
     def mate_internal(self, item1: Item, item2: Item) -> Genes:
-        genes = super().mate_internal(item1, item2)
+        if self.include_top_genes:
+            genes = super().mate_internal(item1, item2)
+        else:
+            genes = IntersectionMating.mate_internal(self, item1, item2)
         ma = max(item1.size, item2.size)
         mi = min(item1.size, item2.size)
 
@@ -251,16 +260,29 @@ class MatingSelectionStrategy(ABC):
 class RandomEveryoneWithEveryone(MatingSelectionStrategy):
 
     def __init__(self, mating_strategy: MatingStrategy = UnionMating(),
-                 pool_size: int = 10):
+                 pool_size: Optional[int] = 10,
+                 allow_self_mating: bool = False):
         super().__init__(mating_strategy)
         self.pool_size = pool_size
+        # The original draws the pool with replacement, so an item can land in
+        # it twice and be mated with itself; its child is a copy of the parent,
+        # which costs a crossover slot. Measured at ~13% of pairs with
+        # pool_size=3. True restores that draw exactly, random stream included,
+        # for reproducing results produced before this was changed.
+        self.allow_self_mating = allow_self_mating
 
     def mating_pool(self, population: Population) -> MatingPoolResult:
         flatten = flatten_population(population)
         pool_size = self.pool_size if self.pool_size is not None else len(
             flatten)
-        return MatingPoolResult(random_utils.choices(flatten, size=self.pool_size),
-                                flatten)
+        if self.allow_self_mating:
+            pool = random_utils.choices(flatten, size=pool_size)
+        else:
+            # Without replacement the pool can be no larger than the population.
+            indices = random_utils.choices(
+                len(flatten), size=min(pool_size, len(flatten)), replace=False)
+            pool = [flatten[i] for i in indices]
+        return MatingPoolResult(pool, flatten)
 
     def mate_pool(self, mating_pool: List["EvalItem"],
                   current_generation: int = 0) -> List[Item]:

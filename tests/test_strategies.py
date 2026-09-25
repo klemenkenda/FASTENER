@@ -143,6 +143,69 @@ def test_weighted_mating_of_identical_parents_is_the_parent():
     assert selected(child.genes) == {2, 3}
 
 
+# Parents with intersection {0}, symmetric difference {1..5}, size gap 3 -> k=2.
+SMALL, LARGE = item_from([0, 1]), item_from([0, 2, 3, 4, 5])
+K = 2
+CLOSE_INFORMATION = information_gain(f1=0.5, f2=0.4, f3=0.4, f4=0.4, f5=0.4)
+
+
+def test_weighted_mating_adds_back_at_most_k_genes():
+    mating = IntersectionMatingWithWeightedRandomInformationGain()
+    mating.scikit_information_gain = CLOSE_INFORMATION
+
+    random_utils.seed(0)
+    for _ in range(100):
+        child = selected(mating.mate(SMALL, LARGE, 1).genes)
+        assert 1 <= len(child - {0}) <= K
+
+
+def test_weighted_mating_does_not_always_take_the_top_genes():
+    mating = IntersectionMatingWithWeightedRandomInformationGain()
+    mating.scikit_information_gain = CLOSE_INFORMATION
+
+    random_utils.seed(0)
+    children = [selected(mating.mate(SMALL, LARGE, 1).genes) for _ in range(100)]
+
+    assert any(1 not in child for child in children)
+
+
+def test_top_genes_flag_always_takes_the_top_genes_and_samples_more():
+    mating = IntersectionMatingWithWeightedRandomInformationGain(
+        include_top_genes=True)
+    mating.scikit_information_gain = CLOSE_INFORMATION
+    top_k = selected(IntersectionMatingWithInformationGain.mate_internal(
+        mating, SMALL, LARGE))
+
+    random_utils.seed(0)
+    children = [selected(mating.mate(SMALL, LARGE, 1).genes) for _ in range(100)]
+
+    assert all(top_k <= child for child in children)
+    assert all(len(child - {0}) <= 2 * K for child in children)
+    assert any(len(child - {0}) > K for child in children)
+
+
+def test_top_genes_flag_reproduces_the_original_child():
+    """The original: the parent class's top-k child, then k weighted draws."""
+    mating = IntersectionMatingWithWeightedRandomInformationGain(
+        include_top_genes=True)
+    mating.scikit_information_gain = CLOSE_INFORMATION
+    difference = [1, 2, 3, 4, 5]
+    weights = mating.scaling([CLOSE_INFORMATION[i] for i in difference])
+
+    for seed in range(20):
+        random_utils.seed(seed)
+        child = mating.mate(SMALL, LARGE, 1).genes
+
+        random_utils.seed(seed)
+        expected = IntersectionMatingWithInformationGain.mate_internal(
+            mating, SMALL, LARGE)
+        for i in random_utils.choices(difference, p=weights / weights.sum(),
+                                      size=K):
+            expected[i] = True
+
+        assert child == expected
+
+
 # --------------------------------------------------------------------------
 # Mating selection
 # --------------------------------------------------------------------------
@@ -165,17 +228,85 @@ def test_everyone_with_everyone_mates_every_pair(pool):
     assert all(c.generation == 4 for c in children)
 
 
+def five_items():
+    return population_of(*[eval_item([i], 0.1 * i) for i in range(4)],
+                         eval_item([0, 1], 0.9))
+
+
 def test_mating_pool_is_drawn_from_the_population():
-    population = population_of(eval_item([0], 0.1), eval_item([1], 0.2),
-                               eval_item([0, 1], 0.3))
-    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=4)
+    population = five_items()
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=3)
 
     random_utils.seed(0)
     result = strategy.mating_pool(population)
 
-    assert len(result.mating_pool) == 4
+    assert len(result.mating_pool) == 3
     assert all(p in flatten_population(population) for p in result.mating_pool)
     assert result.carry_over == flatten_population(population)
+
+
+def test_mating_pool_has_no_repeated_items():
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=4)
+
+    random_utils.seed(0)
+    for _ in range(100):
+        pool = strategy.mating_pool(five_items()).mating_pool
+        assert len({p.number for p in pool}) == 4
+
+
+def test_mating_pool_is_capped_at_the_population_size():
+    population = population_of(eval_item([0], 0.1), eval_item([1], 0.2))
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=10)
+
+    pool = strategy.mating_pool(population).mating_pool
+
+    assert {p.number for p in pool} == \
+        {p.number for p in flatten_population(population)}
+
+
+def test_mating_pool_of_none_takes_the_whole_population():
+    population = five_items()
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=None)
+
+    pool = strategy.mating_pool(population).mating_pool
+
+    assert sorted(p.number for p in pool) == \
+        sorted(p.number for p in flatten_population(population))
+
+
+def test_mating_pool_of_none_works_with_self_mating():
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=None,
+                                          allow_self_mating=True)
+
+    pool = strategy.mating_pool(five_items()).mating_pool
+
+    assert len(pool) == 5
+
+
+def test_self_mating_flag_reproduces_the_original_draw():
+    """The original pool was `choices(flatten, size=pool_size)`, repeats and all."""
+    population = five_items()
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=4,
+                                          allow_self_mating=True)
+
+    random_utils.seed(3)
+    pool = strategy.mating_pool(population).mating_pool
+    random_utils.seed(3)
+    expected = random_utils.choices(flatten_population(population), size=4)
+
+    assert [p.number for p in pool] == [p.number for p in expected]
+
+
+def test_self_mating_flag_allows_repeated_items():
+    strategy = RandomEveryoneWithEveryone(UnionMating(), pool_size=4,
+                                          allow_self_mating=True)
+
+    random_utils.seed(0)
+    repeated = sum(
+        len({p.number for p in strategy.mating_pool(five_items()).mating_pool}) < 4
+        for _ in range(100))
+
+    assert repeated > 0
 
 
 def test_process_population_keeps_parents_and_buckets_children_by_size():
