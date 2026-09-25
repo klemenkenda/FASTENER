@@ -81,3 +81,13 @@ front is re-pruned so it holds no dominated entry.
 Note that the cap must be larger than the initial population, which is evaluated
 before the first generation; a smaller one raises `FitBudgetExhausted` out of
 `mainloop` rather than running a search with nothing in it.
+
+## Tests
+
+Unit tests live in `tests/` and need only FASTENER's own requirements plus
+pytest. From the repo root:
+
+```
+pip install pytest
+python -m pytest tests
+```
