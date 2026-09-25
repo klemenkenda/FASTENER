@@ -16,9 +16,21 @@ from item import Item, Result, Population, flatten_population, FitnessFunction, 
     Genes, EvalItem, RandomFlipMutationStrategy, RandomEveryoneWithEveryone, \
     IntersectionMating, UnionMating, IntersectionMatingWithInformationGain, \
     IntersectionMatingWithWeightedRandomInformationGain, UnevaluatedPopulation, \
-    MatingStrategy, MutationStrategy, MatingSelectionStrategy
+    MatingStrategy, MutationStrategy, MatingSelectionStrategy, SwapStrategy, \
+    RandomSwapStrategy, InformationGainSwapStrategy
 
 Front = Dict[int, EvalItem]
+
+
+class FitBudgetExhausted(Exception):
+    """Raised internally when a run has spent its `max_model_fits` budget.
+
+    Caught by `mainloop`, which stops the search. It exists so the budget is
+    exact: comparing two variants of the algorithm is only meaningful if they
+    are stopped at the same number of model fits, and checking the budget once
+    per generation would let a generation overshoot it by however many subsets
+    it happened to evaluate.
+    """
 
 
 @dataclass
@@ -61,6 +73,26 @@ class Config:
 
     cache_fitness_function: bool = True
 
+    # Stop once this many models have been fitted, instead of running all
+    # `number_of_rounds` generations. None (the default) means no cap, i.e. the
+    # original round-limited behaviour.
+    #
+    # Fits are counted, not evaluations: with `cache_fitness_function` on, a
+    # subset that has been seen before costs nothing and is not counted, so this
+    # is a budget of UNIQUE subsets evaluated. Permutation scoring during
+    # pruning is not counted either -- it only predicts, it does not fit.
+    max_model_fits: Optional[int] = None
+
+    # Write log/<output_folder>/generation_N.pickle every generation. The
+    # pickle holds the whole population, front, mated and mutated sets AND the
+    # full fitness cache, so on a wide data set it runs to several megabytes per
+    # generation: measured at 166 MB and ~10 minutes for 40 generations on
+    # ALLAML (7129 features), which made the logging, not the search, the
+    # dominant cost of a run. Nothing in experiments/ reads these files, so a
+    # batch of hundreds of runs turns them off; the default keeps the original
+    # behaviour for single interactive runs.
+    dump_generation_logs: bool = True
+
     def __post_init__(self) -> None:
         if not self.reset_to_pareto_rounds:
             self.reset_to_pareto_rounds = self.number_of_rounds
@@ -83,7 +115,8 @@ class EntropyOptimizer:
                      Callable[[int, Population, Front], bool]] = None,
                  initial_population: Optional[UnevaluatedPopulation] = None,
                  initial_genes: Optional[List[List[int]]] = None,
-                 config: Optional[Config] = None) -> None:
+                 config: Optional[Config] = None,
+                 swap_strategy: Optional[SwapStrategy] = None) -> None:
         self._model = model
         self.evaluator = evaluator
 
@@ -99,6 +132,9 @@ class EntropyOptimizer:
 
         self.mating_selection_strategy = mating_selection_strategy
         self.mutation_strategy = mutation_strategy
+        # Optional, off by default: with no swap strategy the pruning step is
+        # exactly the original deletion-only one.
+        self.swap_strategy = swap_strategy
 
         self.initial_population = initial_population
         self.initial_genes = initial_genes
@@ -111,6 +147,12 @@ class EntropyOptimizer:
         self.cache_counter: CounterType[int] = Counter()
         self.cache_data: Dict[int, Tuple[Result, Any]] = {}
 
+        # Number of models actually fitted, and why the run ended. Both are
+        # reported by the experiment runner.
+        self.model_fits: int = 0
+        self.stop_reason: Optional[str] = None
+        self.rounds_completed: int = 0
+
         self.population: Population = {}
         self.pareto_front: Front = {}
 
@@ -120,6 +162,15 @@ class EntropyOptimizer:
         return self._model().fit(self.train_data[:, genes], self.train_target)
 
     def _fitness_function(self, genes: "Genes") -> "Tuple[Result, Any]":
+        # The single place a model is fitted, so the single place to count.
+        # Everything that costs a fit passes through here -- mated and mutated
+        # candidates, the pruning step's base evaluation, its deletion candidate
+        # and any swap candidate -- so nothing can spend budget unmetered.
+        if self.config.max_model_fits is not None and \
+                self.model_fits >= self.config.max_model_fits:
+            raise FitBudgetExhausted(
+                f"budget of {self.config.max_model_fits} model fits is spent")
+        self.model_fits += 1
         model = self.train_model(genes)
         return self.evaluator(model, genes, None), model
 
@@ -141,9 +192,12 @@ class EntropyOptimizer:
         for num, item in self.pareto_front.items():
             if num == 1:  # Can't remove features
                 continue
-            new_item = self.purge_item_with_information_gain(item)
-            assert new_item.size == num - 1
-            new_items.append(new_item)
+            candidates = self.purge_item_candidates(item)
+            # The deletion candidate is always first and always one smaller;
+            # any further candidate is a same-sized swap, which competes
+            # against the front entry at `num` instead.
+            assert candidates[0].size == num - 1
+            new_items.extend(candidates)
 
         better = 0
         new = 0
@@ -161,6 +215,18 @@ class EntropyOptimizer:
         self.remove_pareto_non_optimal()
 
     def purge_item_with_information_gain(self, item: "Item") -> "EvalItem":
+        """The deletion candidate for `item`, as in the original algorithm."""
+        return self.purge_item_candidates(item)[0]
+
+    def purge_item_candidates(self, item: "Item") -> "List[EvalItem]":
+        """Pruning candidates for `item`, evaluated.
+
+        The first is always the original deletion candidate: the subset without
+        the feature whose permutation cost the score least. If a swap strategy
+        is configured, same-sized replacement candidates follow -- they reuse
+        the permutation scores computed here, so a swap costs one model fit and
+        no extra scoring pass.
+        """
         base_result, model = self.fitness_function(item.genes)
         on_genes = np.where(item.genes)[0]
         changes = [(1.0, -1) for _ in on_genes]
@@ -177,9 +243,23 @@ class EntropyOptimizer:
         # Unset the gene with the smallest change
         genes2[changes[0][1]] = False
 
-        rt_item = Item(genes2, item.generation + 1, None, None).\
-            evaluate(self.fitness_function)
-        return rt_item
+        candidates = [Item(genes2, item.generation + 1, None, None)
+                      .evaluate(self.fitness_function)]
+
+        if self.swap_strategy is not None:
+            for swapped in self.swap_strategy.propose(item, changes):
+                candidates.append(swapped.evaluate(self.fitness_function))
+
+        return candidates
+
+    def mating_information_gain(self) -> Optional[np.array]:
+        """The mating strategy's mutual-information vector, if it has one."""
+        strategy = getattr(self.mating_selection_strategy, "mating_strategy",
+                           None)
+        vector = getattr(strategy, "scikit_information_gain", None)
+        if vector is None or not len(vector):
+            return None
+        return vector
 
     @staticmethod
     def default_reset_to_pareto(round_num, _population, _front):
@@ -204,6 +284,13 @@ class EntropyOptimizer:
         self.mating_selection_strategy.use_data_information(self.train_data,
                                                             self.train_target)
 
+        if self.swap_strategy is not None:
+            # The mutual-information vector lives on the mating strategy; hand
+            # it over rather than computing a second one.
+            self.swap_strategy.use_data_information(
+                self.train_data, self.train_target,
+                self.mating_information_gain())
+
         pickle.dump(
             self, open(
                 os.path.join(self.config.output_folder, "experiment.pickle"),
@@ -219,40 +306,56 @@ class EntropyOptimizer:
 
         for round_n in range(1, self.config.number_of_rounds + 1):
             print(f"Round: {round_n}")
-            mated = self.mating_selection_strategy.process_population(
-                self.population, round_n
-            )
-            mutated = self.mutation_strategy.process_population(mated)
-            mutated = self.clear_duplicates_after_mating(mutated)
-            # print(mutated)
-            # print(len(mutated))
-            # Evaluate new population
-            # Do not evaluate "empty" genes
-            self.population = self.evaluate_unevaluated(mutated)
+            try:
+                self.run_round(round_n)
+            except FitBudgetExhausted:
+                # The generation was abandoned part-way, so the front may be
+                # holding entries that the interrupted round had not yet pruned.
+                self.remove_pareto_non_optimal()
+                self.stop_reason = "fit_budget"
+                print(f"Stopping: {self.model_fits} model fits spent")
+                return
+            self.rounds_completed = round_n
 
-            self.purge_oversize_buckets()
-            self.update_front_from_population()
-            bef = len(self.pareto_front)
-            self.remove_pareto_non_optimal()
-            aft = len(self.pareto_front)
+        self.stop_reason = "rounds"
 
-            # print(len(flatten_population(self.population)), bef, aft)
+    def run_round(self, round_n: int) -> None:
+        """One generation: mate, mutate, evaluate, update the front, maybe prune."""
+        mated = self.mating_selection_strategy.process_population(
+            self.population, round_n
+        )
+        mutated = self.mutation_strategy.process_population(mated)
+        mutated = self.clear_duplicates_after_mating(mutated)
+        # print(mutated)
+        # print(len(mutated))
+        # Evaluate new population
+        # Do not evaluate "empty" genes
+        self.population = self.evaluate_unevaluated(mutated)
+
+        self.purge_oversize_buckets()
+        self.update_front_from_population()
+        bef = len(self.pareto_front)
+        self.remove_pareto_non_optimal()
+        aft = len(self.pareto_front)
+
+        # print(len(flatten_population(self.population)), bef, aft)
 
 
-            if self.config.reset_to_pareto_rounds and \
-                    round_n % self.config.reset_to_pareto_rounds == 0:
+        if self.config.reset_to_pareto_rounds and \
+                round_n % self.config.reset_to_pareto_rounds == 0:
 
-                self.purge_front_with_information_gain()
+            self.purge_front_with_information_gain()
 
-                self.reset_population_to_front()
-                # print("RESETING POPULATION TO FRONT")
+            self.reset_population_to_front()
+            # print("RESETING POPULATION TO FRONT")
 
-            log_data = LogData(round_n, self.population, self.pareto_front, mated,
-                               mutated, self.cache_counter,
-                               LogData.discard_model(self.cache_data),
-                               random_utils.get_state())
+        log_data = LogData(round_n, self.population, self.pareto_front, mated,
+                           mutated, self.cache_counter,
+                           LogData.discard_model(self.cache_data),
+                           random_utils.get_state())
 
-            # Log during evaluation
+        # Log during evaluation
+        if self.config.dump_generation_logs:
             log_data.dump_log(self.config)
 
     def purge_oversize_buckets(self) -> None:

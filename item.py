@@ -322,3 +322,152 @@ class RandomFlipMutationStrategy(MutationStrategy):
             for j in item.genes
         ]
         return genes
+
+
+class SwapStrategy(ABC):
+    """Size-preserving replacement operator for the pruning step.
+
+    FASTENER's pruning only ever tests *deleting* the weakest feature of a
+    subset. No operator in the algorithm preserves the subset size: mating pulls
+    a child towards the middle size, pruning strictly decreases it, and mutation
+    holds the size constant only when two bits happen to flip at once. A swap is
+    that missing operator: it drops one selected feature and inserts one
+    unselected feature in its place, so the candidate has the same size as its
+    parent and competes directly against the front entry at that size.
+
+    The strategy only *proposes* candidates; the optimizer evaluates them and
+    passes them through the usual Pareto update. Swapping is opt-in -- with no
+    swap strategy the optimizer runs the original deletion-only pruning.
+    """
+
+    def __init__(self, number_of_swaps: int = 1) -> None:
+        # How many replacement candidates to propose per pruned subset. Each one
+        # costs a model fit, so the default is a single candidate.
+        self.number_of_swaps = number_of_swaps
+
+    def use_data_information(self, train_data: np.array, train_target: np.array,
+                             information_gain: Optional[np.array] = None) -> None:
+        """Hook mirroring ``MatingStrategy.use_data_information``.
+
+        ``information_gain`` is the mutual-information vector the mating
+        strategy has already computed over the whole dataset, handed over so a
+        guided swap does not pay for a second ``mutual_info_classif`` pass. It
+        is ``None`` when the mating strategy does not compute one.
+        """
+
+    @abstractmethod
+    def select_removal(self, genes: Genes,
+                       changes: List[Tuple[float, int]]) -> int:
+        """Index of the selected feature to drop.
+
+        ``changes`` are the permutation-importance results the pruning step has
+        already computed, as ``(score_drop, gene_index)`` sorted ascending, so
+        ``changes[0]`` is the feature the model minds losing least.
+        """
+
+    @abstractmethod
+    def select_insertions(self, genes: Genes, removed: int,
+                          count: int) -> List[int]:
+        """Indices of unselected features to try in the removed one's place."""
+
+    def propose(self, item: "Item",
+                changes: List[Tuple[float, int]]) -> List["Item"]:
+        """Swap candidates for ``item``, unevaluated. Empty if none apply."""
+        if not changes or all(item.genes):
+            # Nothing to remove, or nothing left to insert.
+            return []
+
+        removed = self.select_removal(item.genes, changes)
+        candidates: List["Item"] = []
+        seen: Set[int] = set()
+        for added in self.select_insertions(item.genes, removed,
+                                            self.number_of_swaps):
+            if added in seen or item.genes[added]:
+                continue
+            seen.add(added)
+            genes = list(item.genes)
+            genes[removed] = False
+            genes[added] = True
+            candidates.append(Item(genes, item.generation + 1, None, None))
+        return candidates
+
+
+class RandomSwapStrategy(SwapStrategy):
+    """Unguided swap: random feature out, uniformly random feature in.
+
+    The ablation arm. It uses neither the permutation scores nor the mutual
+    information, so comparing it against the guided strategy isolates the value
+    of the guidance rather than of swapping as such.
+    """
+
+    def select_removal(self, genes: Genes,
+                       changes: List[Tuple[float, int]]) -> int:
+        on_genes = np.where(genes)[0]
+        return int(random_utils.choices(on_genes))
+
+    def select_insertions(self, genes: Genes, removed: int,
+                          count: int) -> List[int]:
+        off_genes = np.where(np.logical_not(genes))[0]
+        if not off_genes.size:
+            return []
+        return [int(i) for i in random_utils.choices(
+            off_genes, size=min(count, off_genes.size), replace=False)]
+
+
+class InformationGainSwapStrategy(SwapStrategy):
+    """Guided swap: permutation-weakest feature out, MI-weighted feature in.
+
+    Both ends reuse information FASTENER already computes -- the permutation
+    scores from the pruning step itself, and the mutual-information vector from
+    the mating strategy -- so the guidance costs no extra scoring pass. Sampling
+    the inserted feature (rather than taking the MI-best one) keeps the search
+    stochastic; on a dataset like MADELON the MI-best unselected feature would
+    otherwise be proposed over and over, and `cached_fitness` would make every
+    repeat a no-op.
+    """
+
+    def __init__(self, number_of_swaps: int = 1, scaling=None) -> None:
+        super().__init__(number_of_swaps)
+        self.scaling = scaling or \
+            IntersectionMatingWithWeightedRandomInformationGain.default_scaling
+        self.scikit_information_gain: List[float] = []
+
+    def use_data_information(self, train_data: np.array, train_target: np.array,
+                             information_gain: Optional[np.array] = None) -> None:
+        if information_gain is not None and len(information_gain):
+            # Reuse the mating strategy's vector: same numbers, no second pass.
+            self.scikit_information_gain = information_gain
+        else:
+            self.scikit_information_gain = sklearn.feature_selection. \
+                mutual_info_classif(train_data, train_target)
+
+    def select_removal(self, genes: Genes,
+                       changes: List[Tuple[float, int]]) -> int:
+        # changes is sorted ascending by score drop, so the first entry is the
+        # feature whose permutation cost the least -- the same feature the
+        # original pruning step would have deleted.
+        return int(changes[0][1])
+
+    def select_insertions(self, genes: Genes, removed: int,
+                          count: int) -> List[int]:
+        off_genes = np.where(np.logical_not(genes))[0]
+        if not off_genes.size:
+            return []
+
+        weights = np.asarray(
+            self.scaling([self.scikit_information_gain[i] for i in off_genes]),
+            dtype=float)
+        weights[~np.isfinite(weights)] = 0.0
+        weights[weights < 0] = 0.0
+
+        size = min(count, off_genes.size)
+        if weights.sum() == 0:
+            # Every candidate is uninformative -- fall back to uniform.
+            weights = np.ones_like(weights)
+        elif int((weights > 0).sum()) < size:
+            # Sampling without replacement needs at least `size` non-zero
+            # weights; keep zero-information features reachable but negligible.
+            weights = weights + 1e-12
+
+        return [int(i) for i in random_utils.choices(
+            off_genes, p=weights / weights.sum(), size=size, replace=False)]
