@@ -149,8 +149,9 @@ K = 2
 CLOSE_INFORMATION = information_gain(f1=0.5, f2=0.4, f3=0.4, f4=0.4, f5=0.4)
 
 
-def test_weighted_mating_adds_back_at_most_k_genes():
-    mating = IntersectionMatingWithWeightedRandomInformationGain()
+def test_without_top_genes_weighted_mating_adds_back_at_most_k_genes():
+    mating = IntersectionMatingWithWeightedRandomInformationGain(
+        include_top_genes=False)
     mating.scikit_information_gain = CLOSE_INFORMATION
 
     random_utils.seed(0)
@@ -159,8 +160,13 @@ def test_weighted_mating_adds_back_at_most_k_genes():
         assert 1 <= len(child - {0}) <= K
 
 
-def test_weighted_mating_does_not_always_take_the_top_genes():
-    mating = IntersectionMatingWithWeightedRandomInformationGain()
+def test_weighted_mating_keeps_the_top_genes_by_default():
+    assert IntersectionMatingWithWeightedRandomInformationGain().include_top_genes
+
+
+def test_without_top_genes_weighted_mating_does_not_always_take_them():
+    mating = IntersectionMatingWithWeightedRandomInformationGain(
+        include_top_genes=False)
     mating.scikit_information_gain = CLOSE_INFORMATION
 
     random_utils.seed(0)

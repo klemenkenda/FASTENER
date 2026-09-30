@@ -80,6 +80,16 @@ Note that the cap must be larger than the initial population, which is evaluated
 before the first generation; a smaller one raises `FitBudgetExhausted` out of
 `mainloop` rather than running a search with nothing in it.
 
+## 2026-09-30 — Top genes kept by default
+
+`IntersectionMatingWithWeightedRandomInformationGain` again always adds the
+top-k genes by mutual information before its weighted sample:
+`include_top_genes` now defaults to `True`, as in the 2020 code. That leaves
+one change to the original mating behaviour, no self-mating in
+`RandomEveryoneWithEveryone`. `include_top_genes=False` gives the sample-only
+child described below. Runs with the 2026-09-25 defaults are not comparable
+to runs with these.
+
 ## 2026-09-25 — Bug fixes in the mating step
 
 ### Changes to the original mating behaviour

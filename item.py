@@ -175,15 +175,15 @@ class IntersectionMatingWithInformationGain(IntersectionMating):
 class IntersectionMatingWithWeightedRandomInformationGain(
     IntersectionMatingWithInformationGain):
     def __init__(self, number: Optional[IntScaling] = None,
-                 scaling=None, include_top_genes: bool = False) -> None:
+                 scaling=None, include_top_genes: bool = True) -> None:
         super().__init__(number)
         self.number = number or self.default_number
         self.scaling = scaling or self.default_scaling
-        # The original started from the parent class's child -- the
-        # intersection plus the top-k genes by information gain -- and then
-        # sampled k more, so the top-k were always included and a child got up
-        # to 2k genes back (1.3k on average). True restores that exactly, for
-        # reproducing results produced before this was changed.
+        # True (the default, as in the original) starts from the parent
+        # class's child -- the intersection plus the top-k genes by information
+        # gain -- and then samples k more, so the top-k are always included and
+        # a child gets up to 2k genes back (1.3k on average). False starts from
+        # the plain intersection and adds only the weighted sample.
         self.include_top_genes = include_top_genes
 
     @staticmethod
