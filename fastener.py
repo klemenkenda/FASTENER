@@ -153,6 +153,19 @@ class EntropyOptimizer:
         self.stop_reason: Optional[str] = None
         self.rounds_completed: int = 0
 
+        # What the pruning step did, cumulative over the run. Without these a
+        # swap arm that matches stock FASTENER cannot say whether its swaps
+        # lost every comparison or were barely ever tried. "kept" counts a
+        # candidate still holding its size slot after the front update.
+        self.prune_stats: CounterType[str] = Counter({
+            "pruned_items": 0,
+            "deletion_fits": 0, "deletion_kept": 0,
+            "swap_proposed": 0, "swap_fits": 0, "swap_kept": 0,
+        })
+        # Numbers of the subsets a swap put on the front, so the front at any
+        # point can say how many of its entries a swap made.
+        self.swap_made: Set[int] = set()
+
         self.population: Population = {}
         self.pareto_front: Front = {}
 
@@ -197,11 +210,12 @@ class EntropyOptimizer:
             # any further candidate is a same-sized swap, which competes
             # against the front entry at `num` instead.
             assert candidates[0].size == num - 1
-            new_items.extend(candidates)
+            new_items.append((candidates[0], False))
+            new_items.extend((swapped, True) for swapped in candidates[1:])
 
         better = 0
         new = 0
-        for item in new_items:
+        for item, _ in new_items:
             if item.size in self.pareto_front:
                 if item.result > self.pareto_front[item.size].result:
                     self.pareto_front[item.size] = item
@@ -213,6 +227,20 @@ class EntropyOptimizer:
         # print("Purged:", "better:", better, "new:", new)
 
         self.remove_pareto_non_optimal()
+
+        for item, is_swap in new_items:
+            if self.pareto_front.get(item.size) is not item:
+                continue
+            if is_swap:
+                self.prune_stats["swap_kept"] += 1
+                self.swap_made.add(item.number)
+            else:
+                self.prune_stats["deletion_kept"] += 1
+
+    def front_from_swap(self) -> int:
+        """How many entries of the current front a swap put there."""
+        return sum(item.number in self.swap_made
+                   for item in self.pareto_front.values())
 
     def purge_item_with_information_gain(self, item: "Item") -> "EvalItem":
         """The deletion candidate for `item`, as in the original algorithm."""
@@ -243,12 +271,19 @@ class EntropyOptimizer:
         # Unset the gene with the smallest change
         genes2[changes[0][1]] = False
 
+        self.prune_stats["pruned_items"] += 1
+        fits = self.model_fits
         candidates = [Item(genes2, item.generation + 1, None, None)
                       .evaluate(self.fitness_function)]
+        self.prune_stats["deletion_fits"] += self.model_fits - fits
 
         if self.swap_strategy is not None:
             for swapped in self.swap_strategy.propose(item, changes):
+                self.prune_stats["swap_proposed"] += 1
+                fits = self.model_fits
                 candidates.append(swapped.evaluate(self.fitness_function))
+                # Zero when the subset was already in the cache.
+                self.prune_stats["swap_fits"] += self.model_fits - fits
 
         return candidates
 
