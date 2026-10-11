@@ -38,8 +38,12 @@ class Item:
     parent_b: Optional[Genes]
 
     def __post_init__(self) -> None:
-        self.size = sum(self.genes)
-        self.number = Item.to_number(self.genes)
+        # One numpy view for both, instead of two Python passes over all p
+        # genes: this runs for every candidate, and on wide data (p in the
+        # thousands) it dominated the search's run time.
+        arr = np.asarray(self.genes, dtype=bool)
+        self.size = int(arr.sum())
+        self.number = Item._array_to_number(arr)
 
     def evaluate(self, fitness_function: FitnessFunction) -> "EvalItem":
         result = fitness_function(self.genes)[0]
@@ -59,15 +63,25 @@ class Item:
                 reversed(bin(num)[2:].zfill(num_genes))))
     @classmethod
     def to_number(cls, genes: Genes) -> int:
-        return int(''.join(map(str, map(int, reversed(genes)))), 2)
+        return cls._array_to_number(np.asarray(genes, dtype=bool))
+
+    @staticmethod
+    def _array_to_number(arr: np.ndarray) -> int:
+        # Gene i is bit i (little endian), as the original's string encoding:
+        # the same integer, computed from packed bytes instead of a string of
+        # p characters.
+        if arr.size == 0:
+            return 0
+        return int.from_bytes(np.packbits(arr, bitorder="little").tobytes(),
+                              "little")
 
     @staticmethod
     def gene_union(g1: Genes, g2: Genes) -> Genes:
-        return [i or j for i, j in zip(g1, g2)]
+        return (np.asarray(g1, dtype=bool) | np.asarray(g2, dtype=bool)).tolist()
 
     @staticmethod
     def gene_intersection(g1: Genes, g2: Genes) -> Genes:
-        return [i and j for i, j in zip(g1, g2)]
+        return (np.asarray(g1, dtype=bool) & np.asarray(g2, dtype=bool)).tolist()
 
     @classmethod
     def from_genes(cls, genes: Genes, generation: int = 0) -> "Item":
@@ -75,8 +89,9 @@ class Item:
 
     @classmethod
     def indexed_symmetric_difference(cls, g1: Genes, g2: Genes) -> List[int]:
-        # XOR
-        return [ind for ind, (i, j) in enumerate(zip(g1, g2)) if (i != j)]
+        # XOR, as ascending indices
+        return np.flatnonzero(np.asarray(g1, dtype=bool)
+                              != np.asarray(g2, dtype=bool)).tolist()
 
 
 @dataclass
@@ -339,10 +354,12 @@ class RandomFlipMutationStrategy(MutationStrategy):
         self.prob = prob
 
     def mutate_internal(self, item: "Item") -> Genes:
-        genes = [
-            not j if random_utils.random() < self.prob else j
-            for j in item.genes
-        ]
+        # One draw per gene, as before, but in a single call: numpy's legacy
+        # generator yields the same numbers for random(size=n) as for n calls
+        # of random(), so the random stream -- and every later draw -- is
+        # unchanged.
+        flip = random_utils.random(len(item.genes)) < self.prob
+        genes = (np.asarray(item.genes, dtype=bool) ^ flip).tolist()
         return genes
 
 
