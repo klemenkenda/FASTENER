@@ -2,9 +2,9 @@ import itertools
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable, Dict, Tuple, Any, Set
 from abc import ABC, abstractmethod
-import sklearn.feature_selection
 import numpy as np
 
+import fast_mi
 import random_utils
 
 Genes = List[bool]
@@ -169,8 +169,10 @@ class IntersectionMatingWithInformationGain(IntersectionMating):
 
     def use_data_information(self, train_data: np.array,
                              train_target: np.array) -> None:
-        self.scikit_information_gain = sklearn.feature_selection.\
-            mutual_info_classif(train_data, train_target)
+        # scikit-learn's estimator, computed by sorting each feature: the same
+        # values and the same random draws, several times faster (fast_mi.py).
+        self.scikit_information_gain = fast_mi.mutual_info_classif(
+            train_data, train_target)
 
     def mate_internal(self, item1: Item, item2: Item) -> Genes:
         genes = super().mate_internal(item1, item2)
@@ -477,8 +479,8 @@ class InformationGainSwapStrategy(SwapStrategy):
             # Reuse the mating strategy's vector: same numbers, no second pass.
             self.scikit_information_gain = information_gain
         else:
-            self.scikit_information_gain = sklearn.feature_selection. \
-                mutual_info_classif(train_data, train_target)
+            self.scikit_information_gain = fast_mi.mutual_info_classif(
+                train_data, train_target)
 
     def select_removal(self, genes: Genes,
                        changes: List[Tuple[float, int]]) -> int:
