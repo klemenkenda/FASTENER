@@ -18,7 +18,10 @@ changed, when, and how to reproduce the published behaviour.
 Among the optional additions: `EntropyOptimizer(..., seed_filter="mrmr")` or
 `seed_filter="boruta"` starts the search from that filter's top-k nested
 subsets instead of only the given `initial_genes`. Boruta needs the `Boruta`
-package, which is not a core requirement.
+package, which is not a core requirement. `feature_prior=` and `subset_proposer=`
+take outside guidance -- a relevance score per feature, or a function that
+proposes subsets from the current front -- from any source, such as a
+language model; see `guidance.py`.
 
 ## Tests
 
@@ -66,3 +69,14 @@ over Slovenia, 2017) is published separately:
   doi       = {10.1594/PANGAEA.914271}
 }
 ```
+
+### Applications
+
+Published work that applies FASTENER:
+
+- Uku, S.; Kenda, K. Comparative Analysis of Feature Selection and Imbalance
+  Handling for Semiconductor Defect Detection on the SECOM Dataset. In
+  *Proceedings of Information Society 2026 (SiKDD)*, Ljubljana, Slovenia, 2026.
+  [doi:10.70314/is.2026.sikdd.125](https://doi.org/10.70314/is.2026.sikdd.125).
+  FASTENER is one of three selectors for semiconductor defect detection on SECOM,
+  compared with a Pearson filter and Boruta.

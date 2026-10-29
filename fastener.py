@@ -19,6 +19,8 @@ from item import Item, Result, Population, flatten_population, FitnessFunction, 
     MatingStrategy, MutationStrategy, MatingSelectionStrategy, SwapStrategy, \
     RandomSwapStrategy, InformationGainSwapStrategy
 import seeding
+import guidance
+from guidance import GuidanceContext, ProposalContext
 
 Front = Dict[int, EvalItem]
 
@@ -120,7 +122,14 @@ class EntropyOptimizer:
                  swap_strategy: Optional[SwapStrategy] = None,
                  seed_filter: Optional[str] = None,
                  seed_size: int = 10,
-                 boruta_max_iter: int = 100) -> None:
+                 boruta_max_iter: int = 100,
+                 feature_prior: Optional["guidance.FeaturePrior"] = None,
+                 prior_weight: float = 0.5,
+                 prior_uses: Tuple[str, ...] = guidance.PRIOR_USES,
+                 prior_initial_singles: int = 5,
+                 guidance_context: Optional[GuidanceContext] = None,
+                 subset_proposer: Optional["guidance.SubsetProposer"] = None,
+                 proposer_every: int = 5) -> None:
         self._model = model
         self.evaluator = evaluator
 
@@ -156,6 +165,37 @@ class EntropyOptimizer:
         # features) and the model fits it cost.
         self.seed_ranking: Optional[List[int]] = None
         self.seed_fits: int = 0
+
+        # Optional, off by default: outside guidance (guidance.py). A feature
+        # prior biases mating, mutation and the initial singles; a subset
+        # proposer adds subsets to try every `proposer_every` generations.
+        unknown = set(prior_uses) - set(guidance.PRIOR_USES)
+        if unknown:
+            raise ValueError(f"prior_uses must be among {guidance.PRIOR_USES}, "
+                             f"not {sorted(unknown)}")
+        if not 0.0 <= prior_weight <= 1.0:
+            raise ValueError(f"prior_weight must be in [0, 1], not {prior_weight}")
+        if proposer_every < 1:
+            raise ValueError("proposer_every must be at least 1")
+        self.feature_prior = feature_prior
+        self.prior_weight = prior_weight
+        self.prior_uses = tuple(prior_uses)
+        self.prior_initial_singles = prior_initial_singles
+        self.guidance_context = guidance_context or GuidanceContext(
+            n_features=number_of_genes,
+            feature_names=[f"f{i}" for i in range(number_of_genes)])
+        if self.guidance_context.n_features != number_of_genes:
+            raise ValueError("guidance_context.n_features differs from "
+                             "number_of_genes")
+        self.subset_proposer = subset_proposer
+        self.proposer_every = proposer_every
+        # Filled in by prepare_loop / the rounds: the resolved prior, the
+        # combined weights, the singles drawn from them, and every proposer
+        # call with what it returned and what it cost.
+        self.prior_scores: Optional[np.ndarray] = None
+        self.feature_weights: Optional[np.ndarray] = None
+        self.prior_singles: List[List[int]] = []
+        self.proposal_log: List[Dict[str, Any]] = []
 
         if reset_to_front_predicate is None:
             self.reset_to_front_predicate = EntropyOptimizer.default_reset_to_pareto
@@ -335,6 +375,81 @@ class EntropyOptimizer:
             return None
         return vector
 
+    def __getstate__(self):
+        # The hooks may hold clients or closures that do not pickle; their
+        # results (prior_scores, proposal_log) stay in the state.
+        state = self.__dict__.copy()
+        if callable(state.get("feature_prior")):
+            state["feature_prior"] = None
+        state["subset_proposer"] = None
+        return state
+
+    def apply_feature_prior(self) -> List[List[int]]:
+        """Resolve the prior, combine it with mutual information and hand the
+        weights to the operators in `prior_uses`. Returns the initial singles
+        drawn from the weights ("initial"), else []."""
+        self.mating_selection_strategy.use_data_information(self.train_data,
+                                                            self.train_target)
+        information_gain = self.mating_information_gain()
+        if information_gain is None:
+            if "mating" in self.prior_uses:
+                raise ValueError("prior_uses has 'mating', but the mating "
+                                 "strategy uses no information gain")
+            import fast_mi
+            information_gain = fast_mi.mutual_info_classif(self.train_data,
+                                                           self.train_target)
+        self.prior_scores = guidance.resolve_prior(self.feature_prior,
+                                                   self.guidance_context)
+        self.feature_weights = guidance.combine(information_gain,
+                                                self.prior_scores,
+                                                self.prior_weight)
+        if "mating" in self.prior_uses:
+            self.mating_selection_strategy.mating_strategy \
+                .scikit_information_gain = self.feature_weights
+        if "mutation" in self.prior_uses:
+            if not hasattr(self.mutation_strategy, "use_feature_weights"):
+                raise ValueError("prior_uses has 'mutation', but the mutation "
+                                 "strategy takes no feature weights (use "
+                                 "guidance.PriorGuidedMutationStrategy)")
+            self.mutation_strategy.use_feature_weights(self.feature_weights)
+        if "initial" in self.prior_uses:
+            self.prior_singles = guidance.sample_singles(
+                self.feature_weights, self.prior_initial_singles)
+        return self.prior_singles
+
+    def apply_proposals(self, round_n: int) -> None:
+        """Ask the proposer for subsets, evaluate them and add them to the
+        population and the front. Logged whether or not the budget runs out
+        part-way."""
+        ctx = ProposalContext(
+            guidance=self.guidance_context, generation=round_n,
+            front=guidance.front_summary(self.pareto_front),
+            model_fits=self.model_fits,
+            max_model_fits=self.config.max_model_fits,
+            feature_weights=(None if self.feature_weights is None
+                             else [float(x) for x in self.feature_weights]))
+        proposed = self.subset_proposer(ctx)
+        entry = {"generation": round_n,
+                 "proposed": [[int(i) for i in s] for s in proposed or []],
+                 "evaluated": [], "fits": 0}
+        self.proposal_log.append(entry)
+        fits = self.model_fits
+        try:
+            for genes in guidance.proposals_to_genes(proposed,
+                                                     self.number_of_genes):
+                itm = Item(genes, round_n, None, None) \
+                    .evaluate(self.fitness_function)
+                entry["evaluated"].append(
+                    {"features": [int(i) for i in np.flatnonzero(genes)],
+                     "score": float(itm.result.score)})
+                self.population.setdefault(itm.size, []).append(itm)
+        finally:
+            entry["fits"] = self.model_fits - fits
+        for items in self.population.values():
+            items.sort(reverse=True)
+        self.update_front_from_population()
+        self.remove_pareto_non_optimal()
+
     @staticmethod
     def default_reset_to_pareto(round_num, _population, _front):
         return round_num % 3 == 0
@@ -347,6 +462,12 @@ class EntropyOptimizer:
             self.population = self.evaluate_unevaluated(self.initial_population)
 
         initial_genes = list(self.initial_genes or [])
+        # With a feature prior, the data information is computed first, so
+        # the initial singles can be drawn from the combined weights.
+        guided = self.feature_prior is not None
+        if guided:
+            initial_genes += [genes for genes in self.apply_feature_prior()
+                              if genes not in initial_genes]
         if self.seed_filter is not None:
             initial_genes += [genes for genes in self.filter_seed()
                               if genes not in initial_genes]
@@ -360,8 +481,9 @@ class EntropyOptimizer:
 
         assert self.population, "Some sort of initial population must be provided"
 
-        self.mating_selection_strategy.use_data_information(self.train_data,
-                                                            self.train_target)
+        if not guided:
+            self.mating_selection_strategy.use_data_information(
+                self.train_data, self.train_target)
 
         if self.swap_strategy is not None:
             # The mutual-information vector lives on the mating strategy; hand
@@ -418,6 +540,10 @@ class EntropyOptimizer:
         aft = len(self.pareto_front)
 
         # print(len(flatten_population(self.population)), bef, aft)
+
+        if self.subset_proposer is not None and \
+                round_n % self.proposer_every == 0:
+            self.apply_proposals(round_n)
 
 
         if self.config.reset_to_pareto_rounds and \

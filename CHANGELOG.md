@@ -3,6 +3,52 @@
 Changes to FASTENER since the version published in *Entropy* (2020). For the
 paper, see the Citation section of [README.md](README.md).
 
+## 2026-10-29 — Outside guidance: a feature prior and a subset proposer (off by default)
+
+Two hooks let the caller guide the search with knowledge FASTENER does not
+have -- a language model, a domain expert's ranking, another selector. Both
+live in `guidance.py`; with neither, the search is unchanged.
+
+**Feature prior.** One non-negative relevance score per feature, as an array
+or as a callable that receives a `GuidanceContext` (feature names, task,
+class names, free metadata such as feature descriptions) and returns the
+scores. It is resolved once, before the search, and combined with mutual
+information as `w = MI^(1 - lambda) * prior^lambda` (each scaled to a maximum
+of 1 and floored at 0.001, so the prior biases rather than forbids).
+`prior_uses` chooses what it guides:
+
+- `"mating"`: `w` replaces the information-gain vector the mating strategy
+  sorts and samples by;
+- `"mutation"`: `guidance.PriorGuidedMutationStrategy` adds features in
+  proportion to `w` and drops them in proportion to `max(w) - w`, at the
+  uniform mutation's average rate; without weights it is the uniform mutation,
+  draw for draw;
+- `"initial"`: `prior_initial_singles` single features are drawn from `w`
+  and added to the initial population.
+
+```python
+optimizer = EntropyOptimizer(
+    ..., PriorGuidedMutationStrategy(1 / n_features),
+    feature_prior=scores_or_function, prior_weight=0.5,
+    prior_uses=("mating", "mutation", "initial"), prior_initial_singles=5,
+    guidance_context=GuidanceContext(n_features, names, task="..."))
+```
+
+After `prepare_loop`, `prior_scores`, `feature_weights` and `prior_singles`
+hold what was used.
+
+**Subset proposer.** A callable that receives a `ProposalContext` -- the
+generation, the current front (features and validation score per size), the
+fits spent and the budget, and the weights if there is a prior -- and returns
+subsets to try. It is called every `proposer_every` generations (default 5),
+after the front update; its subsets are evaluated like any candidate, from
+the same fit budget, and join the population. Invalid indices, empty and
+duplicate subsets are dropped. Every call, what it proposed, what was
+evaluated and the fits it cost are kept in `proposal_log`.
+
+**Pickling.** The optimizer's pickled state leaves out a callable prior and
+the proposer, which may hold network clients; their results stay.
+
 ## 2026-10-29 — Filter seeds (off by default)
 
 FASTENER can start from a filter's ranking instead of only the `initial_genes`
