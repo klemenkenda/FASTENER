@@ -3,6 +3,46 @@
 Changes to FASTENER since the version published in *Entropy* (2020). For the
 paper, see the Citation section of [README.md](README.md).
 
+## 2026-10-29 — Filter seeds (off by default)
+
+FASTENER can start from a filter's ranking instead of only the `initial_genes`
+it is given: `seed_filter="mrmr"` or `seed_filter="boruta"` adds the filter's
+top-k nested subsets -- the best feature, the best two, ..., the best
+`seed_size` (default 10) -- to the initial population. Subsets already in
+`initial_genes` are not added twice. `seed_filter=None`, the default, runs the
+search unchanged.
+
+```python
+# mRMR (MID): relevance minus mean redundancy to the features already chosen.
+optimizer = EntropyOptimizer(..., seed_filter="mrmr")
+
+# Boruta on the optimizer's own model; needs `pip install Boruta`.
+optimizer = EntropyOptimizer(..., seed_filter="boruta", seed_size=10,
+                             boruta_max_iter=100)
+```
+
+After `prepare_loop` (or `mainloop`), `seed_ranking` holds the filter's first
+`seed_size` features and `seed_fits` the model fits the filter cost.
+
+**Cost.** Each seed subset is one model fit, as for any initial gene. mRMR
+fits no model of its own. Boruta fits the model once per iteration, and those
+fits are added to `model_fits`, so a run capped by `Config.max_model_fits`
+pays for its seed out of the same budget.
+
+**Model.** Boruta ranks by the optimizer's model, which must expose
+`feature_importances_` (a decision tree or forest does). Each iteration's
+`random_state` from Boruta is passed on to the model if it takes one. Both
+filters use `Config.random_seed` as their random state.
+
+**Details.** mRMR's relevance is scikit-learn's `mutual_info_classif`; its
+redundancy is the mutual information between features binned into 10
+equal-width bins. Boruta ranks every confirmed feature 1 and every tentative
+one 2, so ties are broken on mean shadow-relative importance. Without that, a
+top-k prefix inside the confirmed block would be an arbitrary choice from it.
+The filters live in `seeding.py` and can be used on their own:
+`rank_mrmr(X, y, k)`, `rank_boruta(model_factory, X, y)` and
+`nested_prefixes(order, k)`.
+
 ## 2026-09-25 — Swap operator and fit-capped stopping
 
 Adds guided and random swap strategies to the pruning step, and an optional

@@ -18,6 +18,7 @@ from item import Item, Result, Population, flatten_population, FitnessFunction, 
     IntersectionMatingWithWeightedRandomInformationGain, UnevaluatedPopulation, \
     MatingStrategy, MutationStrategy, MatingSelectionStrategy, SwapStrategy, \
     RandomSwapStrategy, InformationGainSwapStrategy
+import seeding
 
 Front = Dict[int, EvalItem]
 
@@ -116,7 +117,10 @@ class EntropyOptimizer:
                  initial_population: Optional[UnevaluatedPopulation] = None,
                  initial_genes: Optional[List[List[int]]] = None,
                  config: Optional[Config] = None,
-                 swap_strategy: Optional[SwapStrategy] = None) -> None:
+                 swap_strategy: Optional[SwapStrategy] = None,
+                 seed_filter: Optional[str] = None,
+                 seed_size: int = 10,
+                 boruta_max_iter: int = 100) -> None:
         self._model = model
         self.evaluator = evaluator
 
@@ -138,6 +142,20 @@ class EntropyOptimizer:
 
         self.initial_population = initial_population
         self.initial_genes = initial_genes
+
+        # Optional, off by default: start from a filter's top-k nested
+        # subsets (see seeding.py), added to any initial genes given above.
+        if seed_filter is not None and seed_filter not in seeding.SEED_FILTERS:
+            raise ValueError(f"seed_filter must be one of "
+                             f"{seeding.SEED_FILTERS} or None, "
+                             f"not {seed_filter!r}")
+        self.seed_filter = seed_filter
+        self.seed_size = seed_size
+        self.boruta_max_iter = boruta_max_iter
+        # Filled in by prepare_loop: the filter's order (first `seed_size`
+        # features) and the model fits it cost.
+        self.seed_ranking: Optional[List[int]] = None
+        self.seed_fits: int = 0
 
         if reset_to_front_predicate is None:
             self.reset_to_front_predicate = EntropyOptimizer.default_reset_to_pareto
@@ -287,6 +305,27 @@ class EntropyOptimizer:
 
         return candidates
 
+    def filter_seed(self) -> List[List[int]]:
+        """The seed filter's top-k nested subsets, `seed_size` of them.
+
+        Boruta's model fits are added to `model_fits`, so a fit-capped run
+        pays for its seed out of the same budget. mRMR fits no model.
+        """
+        if self.seed_filter == "mrmr":
+            order = seeding.rank_mrmr(self.train_data, self.train_target,
+                                      self.seed_size,
+                                      random_state=self.config.random_seed)
+            fits = 0
+        else:
+            order, _, fits = seeding.rank_boruta(
+                self._model, self.train_data, self.train_target,
+                random_state=self.config.random_seed,
+                max_iter=self.boruta_max_iter)
+        self.seed_ranking = [int(i) for i in order[:self.seed_size]]
+        self.seed_fits = fits
+        self.model_fits += fits
+        return seeding.nested_prefixes(order, self.seed_size)
+
     def mating_information_gain(self) -> Optional[np.array]:
         """The mating strategy's mutual-information vector, if it has one."""
         strategy = getattr(self.mating_selection_strategy, "mating_strategy",
@@ -307,8 +346,13 @@ class EntropyOptimizer:
         if self.initial_population:
             self.population = self.evaluate_unevaluated(self.initial_population)
 
-        if self.initial_genes:
-            for in_gene in self.initial_genes:
+        initial_genes = list(self.initial_genes or [])
+        if self.seed_filter is not None:
+            initial_genes += [genes for genes in self.filter_seed()
+                              if genes not in initial_genes]
+
+        if initial_genes:
+            for in_gene in initial_genes:
                 zeros = np.zeros(self.number_of_genes, dtype=bool)
                 zeros[in_gene] = 1
                 itm = Item(list(zeros), 0, None, None).evaluate(self.fitness_function)

@@ -17,6 +17,11 @@
 numpy>=1.24           # 1.24 removed np.int/np.float; nothing here used them
 scikit-learn>=1.0
 
+# --- optional ---
+# Boruta: only for EntropyOptimizer(seed_filter="boruta"); imported lazily.
+#
+#     pip install Boruta
+
 # scipy and joblib were listed before, but no module in this repo imports
 # either. They are scikit-learn's own dependencies and pip resolves them, so
 # declaring them here only invited them to drift out of step with it.

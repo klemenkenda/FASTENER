@@ -15,6 +15,11 @@ The algorithm has changed since the 2020 paper: new optional operators, and bug
 fixes that change the default search. See [CHANGELOG.md](CHANGELOG.md) for what
 changed, when, and how to reproduce the published behaviour.
 
+Among the optional additions: `EntropyOptimizer(..., seed_filter="mrmr")` or
+`seed_filter="boruta"` starts the search from that filter's top-k nested
+subsets instead of only the given `initial_genes`. Boruta needs the `Boruta`
+package, which is not a core requirement.
+
 ## Tests
 
 Unit tests live in `tests/` and need only FASTENER's own requirements plus
