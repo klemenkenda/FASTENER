@@ -1,4 +1,5 @@
-# FASTENER (FeAture SelecTion ENabled by EntRopy)
+# FASTENER 
+> FeAture SelecTion ENabled by EntRopy
 
 FASTENER is a genetic algorithm for feature selection. It wraps any model
 with `fit` and `predict`, and any score. It searches for the best feature
