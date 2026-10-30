@@ -34,6 +34,104 @@ validation data and returns `Result(score)`, where higher is better. See the
 
 ## Variants
 
+### Lineage and experiment map
+
+The available Git history has one development line (`master`), from the
+2020 implementation to the current component. The branches below are
+**algorithm configurations**, rather than separate Git branches. Optional
+operators can be combined; the tree groups them by what they change.
+Experiment labels follow the companion workspace's `experiments/run_fastener.py`
+and `experiments/run_sota.py` (inventory as of 2026-10-30).
+
+```mermaid
+flowchart TD
+    O["Original FASTENER · 2020"] --> R["2020 behavior retained<br/>fastener_2020"]
+    O --> F["Both mating fixes · September 2026<br/>sample-only crossover; no self-mating"]
+    F --> S["Current stock FASTENER<br/>fastener<br/>top genes restored; no self-mating"]
+    S --> N["No swap · default pruning"]
+    S --> W["Swap added to pruning"]
+    W --> WR["Random swap<br/>fastener_swap_random"]
+    W --> WG["MI-guided swap<br/>fastener_swap_guided"]
+    S --> I["Filter-seeded initial population"]
+    I --> IM["mRMR seed<br/>fastener_seed_mrmr"]
+    I --> IB["Boruta seed<br/>fastener_seed_boruta"]
+    S --> L["LLM guidance · H8<br/>m = opus, sonnet, haiku"]
+    L --> LP["Feature prior<br/>fastener_llm_{m}"]
+    LP --> LS["Neutral-name control<br/>fastener_llm_{m}_scrambled"]
+    LP --> LB["Blind control<br/>fastener_llm_{m}_blind"]
+    LP --> LO["Prior + online subset proposer<br/>fastener_llm_{m}_proposer"]
+    LP --> LA["Opus: one use at a time<br/>fastener_llm_opus_mating<br/>fastener_llm_opus_mutation<br/>fastener_llm_opus_initial"]
+```
+
+#### Historical mating variants
+
+These flags distinguish historical versions even when their experiment
+records use the same `fastener` label. Both belong to the mating strategies.
+
+| Version | `include_top_genes` | `allow_self_mating` | History / experiment use |
+|---|---|---|---|
+| Original 2020 behavior | `True` | `True` | Initial implementation `3ddf707`; current compatibility arm `fastener_2020`, compared in H0. |
+| Both mating fixes | `False` | `False` | `564eb8a` through `144621c`; early H0 runs used this as `fastener`. Weighted crossover adds only its sample to the intersection. |
+| Current stock behavior | `True` | `False` | Since `08e6acd`: mandatory top genes restored; self-mating still disabled. Later stock and derived arms use this version. |
+
+The fourth combination (`False`, `True`) is configurable but is not a named
+arm in the current registry. Matching the flags restores the mating
+behavior; reproducing a particular run also requires matching its data
+split, model, evaluator and initial population. See [CHANGELOG.md](CHANGELOG.md) for compatibility details.
+
+#### Implemented variant families
+
+| Family / experiment label | Change from current stock | Component API and experiment use |
+|---|---|---|
+| Stock: `fastener` | Weighted MI crossover, uniform bit-flip mutation, permutation-importance deletion pruning; no extra guidance. | `swap_strategy=None`, `seed_filter=None`, no prior or proposer. The harness normally starts from five random singletons; the component accepts `initial_genes`. |
+| Random swap: `fastener_swap_random` | Also replaces a random selected feature with a uniformly random unselected feature. | `RandomSwapStrategy`; H2 and later comparisons. |
+| Guided swap: `fastener_swap_guided` | Also replaces the permutation-weakest feature with an unselected feature sampled by MI. | `InformationGainSwapStrategy`; H3 and later comparisons. Each swap candidate consumes a fit. |
+| mRMR seed: `fastener_seed_mrmr` | Starts from nested top-k subsets of an mRMR ranking. | `seed_filter="mrmr"`, `seed_size=10`; H10. |
+| Boruta seed: `fastener_seed_boruta` | Starts from nested top-k subsets of a Boruta ranking. | `seed_filter="boruta"`, `seed_size=10`; H10, H11. Boruta's ranking fits are charged to the budget. |
+| LLM prior: `fastener_llm_{m}` | Mixes MI with a relevance prior, guiding mating, mutation and five initial singletons. | `feature_prior`, `prior_weight=0.5`, `prior_uses=("mating", "mutation", "initial")`, `PriorGuidedMutationStrategy`; H8. |
+| Neutral-name control: `fastener_llm_{m}_scrambled` | The prior sees neutral feature names and no feature descriptions; column order, task, classes and dataset description remain. | A different input prior through the same guidance API; H8. |
+| Blind control: `fastener_llm_{m}_blind` | Also removes the dataset description and shuffles feature presentation order, naming features only by position. | A different input prior through the same guidance API; H8-E02 onward. |
+| Prior + proposer: `fastener_llm_{m}_proposer` | Adds online subset suggestions to the full prior-guided search. | `subset_proposer`, `proposer_every=5`; the harness requests five subsets per call. Suggestions share the evaluation budget. |
+| Single-use prior: `fastener_llm_opus_mating`, `fastener_llm_opus_mutation`, `fastener_llm_opus_initial` | Applies the Opus prior to only the named part of the search. | A one-element `prior_uses`; H8 operator ablations. |
+
+Here `{m}` expands to each of `opus`, `sonnet` and `haiku`, the model aliases
+in the registry. There are **21 registered arms**: six stock, compatibility,
+swap and seed arms; twelve LLM arms (four per model); and three Opus
+ablations. Registration describes available configurations, not evidence
+that every arm has a completed run.
+
+The component's seed API adds filter prefixes to `initial_genes`. The
+H10/H11 harness constructs the prefixes externally and passes them as the
+initial population, replacing the random singletons; it also deducts
+Boruta's ranking fits from the remaining search budget. Match these initial
+populations when comparing seeded runs.
+
+#### Options that apply across the tree
+
+- **Other operators:** `UnionMating`, `IntersectionMating`,
+  `IntersectionMatingWithInformationGain`, weighted MI mating and `NoMating`
+  (mutation-only search) are supported choices, without separate named arms
+  in the current registry. See the [operator reference](docs/reference.md).
+- **Model and task:** decision tree, random forest, LightGBM and ELM are
+  experiment model choices. The harness appends `_elm` for ELM runs.
+  [Regression](docs/regression.md) uses a regressor, a higher-is-better
+  evaluator and a regression MI hook; it is a runnable component example,
+  without a registered regression experiment arm.
+- **Run controls:** round limits, `Config.max_model_fits`, the harness CPU-time
+  cap, trajectory recording and bounded model cache apply across variants.
+  Fit and CPU budgets define different comparisons; record them with the arm.
+- **Implementation revisions:** pruning counters (`b7e724d`), vectorised
+  bookkeeping (`3877a1a`) and faster equivalent MI (`3be5697`) add observability
+  or speed while preserving search behavior. Filter seeds (`8f527ca`) and
+  outside guidance (`5261cd0`) add the optional families above.
+
+NSGA-II, POSS, FS-SDS, standalone mRMR and standalone Boruta are independent
+competitors. For run definitions and evidence, consult the companion
+workspace's `experiments/HYPOTHESES.md`, `experiments/reports/LIST.md` and
+per-run manifests, which record both repositories' revisions.
+
+### Configuring variants
+
 The call above is the base algorithm. Each variant below is one optional
 argument, off by default, and the variants combine freely. They come in two
 kinds: variants of the search operators, and LLM guidance.
